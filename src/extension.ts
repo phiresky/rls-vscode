@@ -20,7 +20,7 @@ import * as fs from 'fs';
 
 import { commands, ExtensionContext, IndentAction, languages, TextEditor,
     TextEditorEdit, window, workspace, TextDocument, WorkspaceFolder, Disposable, Uri,
-    WorkspaceFoldersChangeEvent } from 'vscode';
+    WorkspaceFoldersChangeEvent, Range, Position, TextEditorDecorationType } from 'vscode';
 import { LanguageClient, LanguageClientOptions, Location, NotificationType,
     ServerOptions, ImplementationRequest } from 'vscode-languageclient';
 import { execFile, ExecChildProcessResult } from './utils/child_process';
@@ -137,6 +137,7 @@ class ClientWorkspace {
     lc: LanguageClient | null = null;
     readonly folder: WorkspaceFolder;
     taskProvider: Disposable | null = null;
+    inferredTypes = new InferredTypes();
 
     constructor(folder: WorkspaceFolder) {
         this.config = RLSConfiguration.loadFromWorkspace(folder.uri.fsPath);
@@ -294,6 +295,7 @@ class ClientWorkspace {
                 stopSpinner('RLS');
             }
         });
+        this.lc.onNotification(new NotificationType('rustDocument/inferredSymbolTypes'), arg => this.inferredTypes.changed(arg));
     }
 
     async stop() {
@@ -424,6 +426,74 @@ class ClientWorkspace {
                 );
             }
         });
+    }
+}
+
+type SymbolInferredTypeInformation = { inferred_type: string, location: Location, name: string };
+class InferredTypes {
+    cache = new Map<string, TextEditorDecorationType>();
+
+    changed(_obj: any) {
+        const obj = _obj as { list: Array<SymbolInferredTypeInformation> };
+        console.log('GOT', _obj);
+        if (!window.activeTextEditor) {
+            return;
+        }
+        if (obj.list.length === 0) {
+            return;
+        }
+
+        const editor = window.activeTextEditor;
+        if (editor.document.uri.toString() !== obj.list[0].location.uri) {
+            console.warn('URI changed');
+            return;
+        }
+
+        const news = new Map([...this.cache.entries()].map(([k, decoration]) =>
+            [k, { decoration, ranges: [] }] as [string, { decoration: TextEditorDecorationType, ranges: Range[] }]));
+        for (const ele of obj.list) {
+            const { key, decoration } = this.getDecoration(ele);
+            const convertLocation = (x: Location['range']['start']) => new Position(x.line, x.character);
+            const range = new Range(convertLocation(ele.location.range.start), convertLocation(ele.location.range.end));
+            const txtAfter = editor.document.getText(new Range(range.end, new Position(range.end.line, Infinity)));
+            if (txtAfter.match(/^\s*:/)) {
+                // has explicit type annotation (hacky)
+                continue;
+            }
+            let res = news.get(key);
+            if (!res) {
+                news.set(key, res = { decoration, ranges: [] });
+            }
+            res.ranges.push(range);
+
+        }
+        for (const { decoration, ranges } of news.values()) {
+            editor.setDecorations(decoration, ranges);
+            // TODO: if (ranges.length === 0) clear from cache map to prevent memory leak
+        }
+    }
+    getDecoration(ele: SymbolInferredTypeInformation) {
+        // hack to do shorten "&std::vec::Vec<glob::ee::Tokens>" -> &Vec<Tokens>
+        const shortType = ele.inferred_type.replace(/(\w+::(?=\w))/g, '');
+
+        const key = ': ' + shortType;
+        let decoration = this.cache.get(key);
+        if (!decoration) {
+            decoration = window.createTextEditorDecorationType({
+                after: {
+                    contentText: key,
+                    border: '1px solid gray',
+                    fontWeight: '100',
+                    color: '#9c9c9c',
+                    backgroundColor: '#2f2f2f',
+                    borderRadius: '3px',
+                    margin: '1px',
+                    textDecoration: 'test',
+                } as any
+            });
+            this.cache.set(key, decoration);
+        }
+        return { key, decoration };
     }
 }
 
